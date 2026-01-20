@@ -33,6 +33,16 @@ namespace UtilityHud
 
         private static HudState state;
 
+        private void Start()
+        {
+            EnableUtilityHUD();
+        }
+
+        private void Update()
+        {
+            UpdateUtilityHUD();
+        }
+
         public static void EnableUtilityHUD()
         {
             state.Enabled = true;
