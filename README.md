@@ -10,4 +10,4 @@
 - Music controller - press right secondary to enable control mode, left trig = prev song, right trig = next song, right primary = pause/play
 
 # NOTE
--# If you wish to use this in your own project please ask as i will likely say yes
+- If you wish to use this in your own project please ask as i will likely say yes
