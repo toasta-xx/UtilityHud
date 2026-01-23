@@ -1,7 +1,7 @@
 # UtilityHUD
 - A simple HUD overlay that displays information in-game.
 
-# Features [NEW]
+# Features
 - Speed Display - Shows your current movement speed and maximum speed (current SpeedCap)
 - FPS Counter - Displays your current FPS
 - Session Timer - Tracks how long you've been playing
