@@ -1,66 +1,58 @@
-﻿using BepInEx;
+using BepInEx;
 using HarmonyLib;
 using UnityEngine;
 using GorillaLocomotion;
 using Photon.Pun;
 using TMPro;
-using System.Collections;
 using System.Linq;
 
 namespace UtilityHud
 {
-    //creds to ii for quicksong
-    //creds to ii/graze for keycode inputs
     [BepInPlugin(Constants.GUID, Constants.NAME, Constants.VERS)]
     public class Plugin : BaseUnityPlugin
     {
-        private static Harmony harmonyInstance;
-        public void Awake()
+        void Awake()
         {
-            harmonyInstance = Harmony.CreateAndPatchAll(typeof(Plugin).Assembly, Constants.GUID);
+            Harmony.CreateAndPatchAll(typeof(Plugin).Assembly, Constants.GUID);
             gameObject.AddComponent<Main>();
+            gameObject.AddComponent<ARS>();
         }
     }
 
     public class Main : MonoBehaviour
     {
-        private static GameObject? hudObj;
-        private static TextMeshPro? hudText;
-        private static bool hudEnabled;
-        private static float sessionStart;
-        private static int fps;
-        private static float fpsTime;
+        static GameObject hudObj;
+        static TextMeshPro hudText;
+        static bool hudEnabled;
+        static float sessionStart, fpsTime;
+        static int fps;
 
-        private void Start()
+        void Start()
         {
-            GorillaTagger.OnPlayerSpawned(delegate { EnableUtilityHUD(); });
+            var media = new GameObject("MusicDisplay");
+            media.AddComponent<MusicDisplay>();
+            DontDestroyOnLoad(media);
+            GorillaTagger.OnPlayerSpawned(OnPlayerSpawned);
         }
 
-        private void Update()
-        {
-            UpdateUtilityHUD();
-            MusicDisplay.UpdateMusicDisplay();
-        }
-
-        public static void EnableUtilityHUD()
+        void OnPlayerSpawned()
         {
             hudEnabled = true;
             if (sessionStart == 0f) sessionStart = Time.time;
             InitializeHUD();
+            MusicDisplay.playerSpawned = true;
         }
 
-        private static void InitializeHUD()
+        void Update() => UpdateHUD();
+
+        static void InitializeHUD()
         {
             if (hudObj != null || Camera.main == null) return;
             hudObj = new GameObject("UtilityHUD");
             hudText = hudObj.AddComponent<TextMeshPro>();
             hudText.richText = true;
             var rig = GorillaTagger.Instance?.offlineVRRig;
-            if (rig != null)
-            {
-                hudText.material = Object.Instantiate(rig.playerText1.material);
-                hudText.font = rig.playerText1.font;
-            }
+            if (rig != null) { hudText.material = Object.Instantiate(rig.playerText1.material); hudText.font = rig.playerText1.font; }
             else hudText.font = Resources.FindObjectsOfTypeAll<TMP_FontAsset>().FirstOrDefault();
             hudText.fontSize = 1.5f;
             hudText.alignment = TextAlignmentOptions.TopLeft;
@@ -68,10 +60,9 @@ namespace UtilityHud
             hudText.transform.SetParent(Camera.main.transform, false);
             hudText.transform.localPosition = new Vector3(0.9f, 0.01f, 0.5f);
             hudText.color = Color.white;
-            MusicDisplay.InitializeMusicDisplay();
         }
 
-        public static void UpdateUtilityHUD()
+        static void UpdateHUD()
         {
             if (!hudEnabled || hudObj == null || hudText == null || Camera.main == null) { if (hudObj == null) InitializeHUD(); return; }
             try
@@ -83,7 +74,7 @@ namespace UtilityHud
                     if (rig != null) fps = Traverse.Create(rig).Field("fps").GetValue<int>();
                 }
                 var rb = GTPlayer.Instance?.bodyCollider?.attachedRigidbody;
-                var speed = rb != null ? $"Speed: {rb.linearVelocity.magnitude:F1} m/s\nMax Speed: {GTPlayer.Instance.maxJumpSpeed:F1} m/s" : "Speed: N/A";
+                var speed = rb != null ? $"Speed: {rb.linearVelocity.magnitude:F1} m/s\nMax Speed: {GTPlayer.Instance?.maxJumpSpeed:F1} m/s" : "Speed: N/A";
                 var elapsed = sessionStart == 0f ? 0f : Time.time - sessionStart;
                 var h = Mathf.FloorToInt(elapsed / 3600f);
                 var m = Mathf.FloorToInt((elapsed % 3600f) / 60f);

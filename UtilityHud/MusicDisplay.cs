@@ -9,234 +9,180 @@ using System.Threading.Tasks;
 using UnityEngine;
 using TMPro;
 using System.Linq;
-using GorillaLocomotion;
 using Valve.Newtonsoft.Json;
 using Object = UnityEngine.Object;
 
 namespace UtilityHud
 {
-    public class MusicDisplayCoroutineRunner : MonoBehaviour { }
-
-    public class MusicDisplay
+    public class MusicDisplay : MonoBehaviour
     {
-        [DllImport("user32.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.StdCall)] private static extern void keybd_event(uint bVk, uint bScan, uint dwFlags, uint dwExtraInfo);
-        private enum VirtualKeyCodes : uint { NEXT_TRACK = 0xB0, PREVIOUS_TRACK = 0xB1, PLAY_PAUSE = 0xB3 }
+        [DllImport("user32.dll")]
+        static extern void keybd_event(uint bVk, uint bScan, uint dwFlags, uint dwExtraInfo);
 
-        private static GameObject? parent, albumObj, musicObj;
-        private static TextMeshPro? musicText;
-        private static SpriteRenderer? albumSprite;
-        private static Texture2D? albumTexture;
-        private static bool musicEnabled = true, paused = true, controlMode = false, lastSecondaryState = false, lastPrimaryState = false, wasControlMode = false;
-        private static float updateTime, startTime, endTime, elapsedTime, lastSyncTime, prevCooldown, nextCooldown, playCooldown, lastLeftIndex = 1f, lastRightIndex = 1f;
-        private static string title = "No Media Playing", artist = "", platform = "", quickSongPath = "";
-        private static Process? currentProcess;
-        private static MusicDisplayCoroutineRunner? coroutineRunner;
+        enum VK : uint { Next = 0xB0, Prev = 0xB1, PlayPause = 0xB3 }
 
-        public static void InitializeMusicDisplay()
+        public static MusicDisplay instance;
+        public static string Title = "No Media Playing", Artist = "";
+        public static bool playerSpawned;
+
+        static string qsPath;
+        static readonly Texture2D icon = new Texture2D(2, 2);
+        static TextMeshPro musicText;
+        static SpriteRenderer albumSprite;
+        static Sprite spriteAsset;
+        static Task fetchTask;
+        static bool uiReady, spriteQueued, controlMode, wasControl, lastB, lastA;
+        static float nextPoll, cdPrev, cdNext, cdPlay, lastL = 1f, lastR = 1f;
+
+        static bool FetchIdle => fetchTask == null || fetchTask.IsCompleted;
+
+        static void Press(VK key)
         {
-            if (parent != null || Camera.main == null) return;
-            parent = new GameObject("MusicDisplay");
-            parent.transform.SetParent(Camera.main.transform, false);
-            parent.transform.localPosition = new Vector3(0.5f, 0.3f, 0.5f);
-            coroutineRunner = parent.AddComponent<MusicDisplayCoroutineRunner>();
+            keybd_event((uint)key, 0, 0, 0);
+            keybd_event((uint)key, 0, 0x0002, 0);
+        }
 
+        void Awake()
+        {
+            instance = this;
+            qsPath = Path.Combine(Path.GetTempPath(), "QuickSong.exe");
+            try { foreach (var p in Process.GetProcessesByName("QuickSong")) try { p.Kill(); p.Dispose(); } catch { } } catch { }
+            try { if (File.Exists(qsPath)) File.Delete(qsPath); } catch { }
+            try
+            {
+                using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("UtilityHud.Resources.QuickSong.exe"))
+                if (s != null) using (var f = new FileStream(qsPath, FileMode.Create, FileAccess.Write)) s.CopyTo(f);
+            }
+            catch { }
+        }
+
+        public void InitializeUI()
+        {
+            if (uiReady || Camera.main == null) return;
+            var cam = Camera.main.transform;
             var rig = GorillaTagger.Instance?.offlineVRRig;
             var font = rig?.playerText1?.font ?? Resources.FindObjectsOfTypeAll<TMP_FontAsset>().FirstOrDefault();
-            var material = rig != null ? Object.Instantiate(rig.playerText1.material) : null;
+            var mat = rig != null ? Object.Instantiate(rig.playerText1.material) : null;
 
-            albumObj = new GameObject("AlbumImage");
-            albumObj.transform.SetParent(parent.transform, false);
-            albumObj.transform.localPosition = new Vector3(-0.77f, -0.09f, 0f);
-            albumSprite = albumObj.AddComponent<SpriteRenderer>();
-            albumSprite.transform.localScale = Vector3.one * 0.05f;
+            var album = new GameObject("AlbumArt");
+            album.transform.SetParent(cam, false);
+            album.transform.localPosition = new Vector3(-0.27f, 0.21f, 0.5f);
+            album.transform.localScale = Vector3.one * 0.05f;
+            albumSprite = album.AddComponent<SpriteRenderer>();
 
-            musicObj = new GameObject("MusicText");
-            musicText = musicObj.AddComponent<TextMeshPro>();
+            var text = new GameObject("MusicText");
+            musicText = text.AddComponent<TextMeshPro>();
             musicText.richText = true;
-            if (material != null) musicText.material = material;
+            if (mat != null) musicText.material = mat;
             if (font != null) musicText.font = font;
             musicText.fontSize = 1.5f;
             musicText.alignment = TextAlignmentOptions.TopLeft;
-            musicText.transform.localScale = Vector3.one * 0.08f;
-            musicText.transform.SetParent(parent.transform, false);
-            musicText.transform.localPosition = new Vector3(0f, -0.32f, 0f);
+            text.transform.SetParent(cam, false);
+            text.transform.localPosition = new Vector3(0.5f, -0.02f, 0.5f);
+            text.transform.localScale = Vector3.one * 0.08f;
             musicText.color = Color.white;
-
-            quickSongPath = Path.Combine(Path.GetTempPath(), "QuickSong.exe");
-            if (File.Exists(quickSongPath)) File.Delete(quickSongPath);
-            using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("UtilityHud.Resources.QuickSong.exe"))
-            using (var fs = new FileStream(quickSongPath, FileMode.Create, FileAccess.Write))
-                stream?.CopyTo(fs);
+            uiReady = true;
         }
 
-        public static void UpdateMusicDisplay()
+        static async Task FetchAsync()
         {
-            if (!musicEnabled) { if (parent != null) parent.SetActive(false); return; }
-            if (parent == null || musicText == null) { InitializeMusicDisplay(); return; }
-            if (Camera.main == null) return;
-            if (!parent.activeSelf) parent.SetActive(true);
-
-            if (Time.time - updateTime > 0.5f)
-            {
-                updateTime = Time.time;
-                _ = UpdateMusicInfoAsync();
-            }
-
-            var controlStatus = controlMode ? " [Control Mode]" : "";
-            musicText.text = $"{title}\nCreator: {artist}{controlStatus}";
-
-            if (ControllerInputPoller.instance == null) return;
-
-            var secondaryPressed = ControllerInputPoller.instance.rightControllerSecondaryButton;
-            if (secondaryPressed && !lastSecondaryState)
-            {
-                controlMode = !controlMode;
-                if (controlMode && !wasControlMode)
-                {
-                    lastLeftIndex = ControllerInputPoller.instance.leftControllerIndexFloat;
-                    lastRightIndex = ControllerInputPoller.instance.rightControllerIndexFloat;
-                    lastPrimaryState = ControllerInputPoller.instance.rightControllerPrimaryButton;
-                }
-            }
-            lastSecondaryState = secondaryPressed;
-
-            if (controlMode)
-            {
-                if (wasControlMode)
-                {
-                    var leftIndex = ControllerInputPoller.instance.leftControllerIndexFloat;
-                    if (lastLeftIndex >= 0.5f && leftIndex < 0.5f && Time.time > prevCooldown)
-                    {
-                        prevCooldown = Time.time + 0.5f;
-                        PreviousTrack();
-                    }
-                    lastLeftIndex = leftIndex;
-
-                    var rightIndex = ControllerInputPoller.instance.rightControllerIndexFloat;
-                    if (lastRightIndex >= 0.5f && rightIndex < 0.5f && Time.time > nextCooldown)
-                    {
-                        nextCooldown = Time.time + 0.5f;
-                        NextTrack();
-                    }
-                    lastRightIndex = rightIndex;
-
-                    var primaryPressed = ControllerInputPoller.instance.rightControllerPrimaryButton;
-                    if (primaryPressed && !lastPrimaryState && Time.time > playCooldown)
-                    {
-                        playCooldown = Time.time + 0.5f;
-                        PlayPause();
-                    }
-                    lastPrimaryState = primaryPressed;
-                }
-            }
-            wasControlMode = controlMode;
-        }
-
-        private static void CloseOldQuickSongProcesses()
-        {
+            if (string.IsNullOrEmpty(qsPath) || !File.Exists(qsPath)) return;
             try
             {
-                if (currentProcess != null && !currentProcess.HasExited)
+                using (var proc = new Process
                 {
-                    try { currentProcess.Kill(); } catch { }
-                    currentProcess.Dispose();
-                    currentProcess = null;
-                }
-                foreach (var proc in Process.GetProcessesByName("QuickSong"))
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = qsPath, Arguments = "-all",
+                        UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true
+                    }
+                })
                 {
-                    try { proc.Kill(); } catch { }
+                    proc.Start();
+                    var output = await proc.StandardOutput.ReadToEndAsync();
+                    if (!proc.HasExited) proc.WaitForExit(5000);
+                    if (!proc.HasExited) try { proc.Kill(); } catch { }
+
+                    Title = "No Media Playing";
+                    Artist = "";
+
+                    var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(output);
+                    if (data == null) return;
+
+                    Title = data.TryGetValue("Title", out var t) ? (string)t : "No Media Playing";
+                    Artist = data.TryGetValue("Artist", out var a) ? (string)a : "";
+
+                    if (data.TryGetValue("ThumbnailBase64", out var thumb) && !string.IsNullOrEmpty((string)thumb))
+                    {
+                        icon.LoadImage(Convert.FromBase64String((string)thumb));
+                        spriteQueued = true;
+                    }
                 }
             }
             catch { }
         }
 
-        private static async Task UpdateMusicInfoAsync()
+        IEnumerator FetchAfter(float delay)
         {
-            if (string.IsNullOrEmpty(quickSongPath) || !File.Exists(quickSongPath)) return;
-            CloseOldQuickSongProcesses();
-            try
+            yield return new WaitForSeconds(delay);
+            if (FetchIdle) fetchTask = FetchAsync();
+        }
+
+        void Update()
+        {
+            if (!playerSpawned) return;
+            if (!uiReady) { InitializeUI(); return; }
+            if (musicText == null || Camera.main == null) { uiReady = false; return; }
+
+            if (Time.time > nextPoll && FetchIdle) { nextPoll = Time.time + 2f; fetchTask = FetchAsync(); }
+
+            if (spriteQueued && albumSprite != null)
             {
-                currentProcess = new Process { StartInfo = new ProcessStartInfo { FileName = quickSongPath, Arguments = "-all", UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true } };
-                currentProcess.Start();
-                var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(await currentProcess.StandardOutput.ReadToEndAsync());
-                await Task.Run(() => currentProcess.WaitForExit());
-                
-                title = "No Media Playing";
-                artist = "";
-                startTime = 0f;
-                endTime = 0f;
-                elapsedTime = 0f;
-                paused = true;
-                
-                if (data == null) { if (currentProcess != null) { currentProcess.Dispose(); currentProcess = null; } return; }
-                
-                title = data.TryGetValue("Title", out var t) ? (string)t : "No Media Playing";
-                artist = data.TryGetValue("Artist", out var a) ? (string)a : "";
-                var newStartTime = data.TryGetValue("StartTime", out var st) ? Convert.ToSingle(st) : 0f;
-                var newEndTime = data.TryGetValue("EndTime", out var et) ? Convert.ToSingle(et) : 0f;
-                var newElapsedTime = data.TryGetValue("ElapsedTime", out var el) ? Convert.ToSingle(el) : 0f;
-                var newPaused = !data.TryGetValue("Status", out var s) || (string)s != "Playing";
-                
-                startTime = newStartTime;
-                endTime = newEndTime;
-                elapsedTime = newElapsedTime;
-                paused = newPaused;
-                lastSyncTime = Time.time;
-                var appId = data.TryGetValue("AppId", out var id) ? (string)id : "";
-                var appIdLower = appId.ToLower();
-                if (appIdLower.Contains("spotify")) platform = "Spotify";
-                else if (appIdLower.Contains("youtube music") || (appIdLower.Contains("youtube") && appIdLower.Contains("music"))) platform = "YouTube Music";
-                else if (appIdLower.Contains("youtube")) platform = "YouTube";
-                else if (appIdLower.Contains("chrome")) platform = "Chrome";
-                else if (appIdLower.Contains("firefox")) platform = "Firefox";
-                else if (appIdLower.Contains("edge") || appIdLower.Contains("msedge")) platform = "Edge";
-                else if (appIdLower.Contains("brave")) platform = "Brave";
-                else if (appIdLower.Contains("opera")) platform = "Opera";
-                else if (appIdLower.Contains("safari")) platform = "Safari";
-                else if (appIdLower.Contains("itunes")) platform = "iTunes";
-                else if (appIdLower.Contains("vlc")) platform = "VLC";
-                else if (appIdLower.Contains("windows media player")) platform = "Windows Media Player";
-                else if (appIdLower.Contains("media player")) platform = "Media Player";
-                else if (appIdLower.Contains("winamp")) platform = "Winamp";
-                else if (appIdLower.Contains("foobar")) platform = "Foobar2000";
-                else if (appIdLower.Contains("musicbee")) platform = "MusicBee";
-                else if (appIdLower.Contains("web") || appIdLower.Contains("browser")) platform = "Web Player";
-                else platform = appId.Length > 20 ? appId.Substring(0, 20) : (string.IsNullOrEmpty(appId) ? "Unknown" : appId);
-                if (data.TryGetValue("ThumbnailBase64", out var thumb) && albumSprite != null && !string.IsNullOrEmpty((string)thumb))
-                {
-                    if (albumTexture != null) Object.Destroy(albumTexture);
-                    albumTexture = new Texture2D(1, 1);
-                    albumTexture.LoadImage(Convert.FromBase64String((string)thumb));
-                    albumSprite.sprite = Sprite.Create(albumTexture, new Rect(0, 0, albumTexture.width, albumTexture.height), new Vector2(0.5f, 0.5f));
-                }
-                if (currentProcess != null) { currentProcess.Dispose(); currentProcess = null; }
+                spriteQueued = false;
+                if (spriteAsset != null) Object.Destroy(spriteAsset);
+                spriteAsset = Sprite.Create(icon, new Rect(0, 0, icon.width, icon.height), new Vector2(0.5f, 0.5f));
+                albumSprite.sprite = spriteAsset;
             }
-            catch { title = "No Media Playing"; artist = platform = ""; if (currentProcess != null) { try { currentProcess.Dispose(); } catch { } currentProcess = null; } }
+
+            musicText.text = controlMode ? $"{Title}\nCreator: {Artist} [Control Mode]" : $"{Title}\nCreator: {Artist}";
+
+            var input = ControllerInputPoller.instance;
+            if (input == null) return;
+
+            var bDown = input.rightControllerSecondaryButton;
+            if (bDown && !lastB)
+            {
+                controlMode = !controlMode;
+                if (controlMode && !wasControl)
+                {
+                    lastL = input.leftControllerIndexFloat;
+                    lastR = input.rightControllerIndexFloat;
+                    lastA = input.rightControllerPrimaryButton;
+                }
+            }
+            lastB = bDown;
+
+            if (controlMode && wasControl)
+            {
+                var li = input.leftControllerIndexFloat;
+                if (lastL >= 0.5f && li < 0.5f && Time.time > cdPrev) { cdPrev = Time.time + 0.5f; Press(VK.Prev); StartCoroutine(FetchAfter(0.1f)); }
+                lastL = li;
+
+                var ri = input.rightControllerIndexFloat;
+                if (lastR >= 0.5f && ri < 0.5f && Time.time > cdNext) { cdNext = Time.time + 0.5f; Press(VK.Next); StartCoroutine(FetchAfter(0.1f)); }
+                lastR = ri;
+
+                var aDown = input.rightControllerPrimaryButton;
+                if (aDown && !lastA && Time.time > cdPlay) { cdPlay = Time.time + 0.5f; Press(VK.PlayPause); }
+                lastA = aDown;
+            }
+            wasControl = controlMode;
         }
 
-
-        private static void SendKey(VirtualKeyCodes vk) => keybd_event((uint)vk, 0, 0, 0);
-        private static IEnumerator DelayedUpdate()
+        void OnDestroy()
         {
-            yield return new WaitForSeconds(0.1f);
-            _ = UpdateMusicInfoAsync();
-        }
-        public static void NextTrack()
-        {
-            if (coroutineRunner != null) coroutineRunner.StartCoroutine(DelayedUpdate());
-            elapsedTime = 0f;
-            SendKey(VirtualKeyCodes.NEXT_TRACK);
-        }
-        public static void PreviousTrack()
-        {
-            if (coroutineRunner != null) coroutineRunner.StartCoroutine(DelayedUpdate());
-            elapsedTime = 0f;
-            SendKey(VirtualKeyCodes.PREVIOUS_TRACK);
-        }
-        public static void PlayPause()
-        {
-            paused = !paused;
-            SendKey(VirtualKeyCodes.PLAY_PAUSE);
+            foreach (var p in Process.GetProcessesByName("QuickSong"))
+                try { p.Kill(); p.Dispose(); } catch { }
         }
     }
 }
