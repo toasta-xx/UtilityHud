@@ -11,7 +11,7 @@ namespace UtilityHud
 {
     internal class ARS : MonoBehaviour
     {
-        //Creds to Industry for this
+        //Creds to Industry for this.
         void Start()
         {
             EasierLog("ARS fully initialized, thank you for helping the gorilla tag modding community!");

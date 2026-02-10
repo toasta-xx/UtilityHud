@@ -1,10 +1,8 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using UnityEngine;
 using TMPro;
@@ -16,45 +14,58 @@ namespace UtilityHud
 {
     public class MusicDisplay : MonoBehaviour
     {
-        [DllImport("user32.dll")]
-        static extern void keybd_event(uint bVk, uint bScan, uint dwFlags, uint dwExtraInfo);
-
-        enum VK : uint { Next = 0xB0, Prev = 0xB1, PlayPause = 0xB3 }
-
         public static MusicDisplay instance;
         public static string Title = "No Media Playing", Artist = "";
         public static bool playerSpawned;
 
-        static string qsPath;
+        static string helperPath;
+        static Process helper;
+        static StreamWriter helperIn;
+        static StreamReader helperOut;
         static readonly Texture2D icon = new Texture2D(2, 2);
         static TextMeshPro musicText;
         static SpriteRenderer albumSprite;
         static Sprite spriteAsset;
         static Task fetchTask;
-        static bool uiReady, spriteQueued, controlMode, wasControl, lastB, lastA;
-        static float nextPoll, cdPrev, cdNext, cdPlay, lastL = 1f, lastR = 1f;
+        static float fetchStart, nextPoll, nextFullPoll, cdPrev, cdNext, cdPlay, lastL = 1f, lastR = 1f;
+        static string pendingTitle, pendingArtist;
+        static int noMediaStreak;
+        static bool uiReady, spriteQueued, dataQueued, controlMode, wasControl, lastB, lastA;
+        static float initUntil;
 
+        const float LightInterval = 0.05f, FullInterval = 1f, InputCooldown = 0.1f, InitDuration = 20f;
         static bool FetchIdle => fetchTask == null || fetchTask.IsCompleted;
-
-        static void Press(VK key)
-        {
-            keybd_event((uint)key, 0, 0, 0);
-            keybd_event((uint)key, 0, 0x0002, 0);
-        }
+        static bool HelperAlive => helper != null && !helper.HasExited;
 
         void Awake()
         {
             instance = this;
-            qsPath = Path.Combine(Path.GetTempPath(), "QuickSong.exe");
-            try { foreach (var p in Process.GetProcessesByName("QuickSong")) try { p.Kill(); p.Dispose(); } catch { } } catch { }
-            try { if (File.Exists(qsPath)) File.Delete(qsPath); } catch { }
+            helperPath = Path.Combine(Path.GetTempPath(), "QuickerSong.exe");
+            try { foreach (var p in Process.GetProcessesByName("QuickerSong")) try { p.Kill(); p.Dispose(); } catch { } } catch { }
+            try { if (File.Exists(helperPath)) File.Delete(helperPath); } catch { }
             try
             {
-                using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("UtilityHud.Resources.QuickSong.exe"))
-                if (s != null) using (var f = new FileStream(qsPath, FileMode.Create, FileAccess.Write)) s.CopyTo(f);
+                using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("UtilityHud.Resources.QuickerSong.exe"))
+                if (s != null) using (var f = new FileStream(helperPath, FileMode.Create, FileAccess.Write)) s.CopyTo(f);
+            }
+            catch { }
+            StartHelper();
+        }
+
+        static void StartHelper()
+        {
+            if (string.IsNullOrEmpty(helperPath) || !File.Exists(helperPath)) return;
+            try
+            {
+                helper = new Process { StartInfo = new ProcessStartInfo(helperPath) { UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true } };
+                helper.Start();
+                helperIn = helper.StandardInput;
+                helperOut = helper.StandardOutput;
             }
             catch { }
         }
+
+        static void Send(string cmd) { if (HelperAlive) try { helperIn.WriteLine(cmd); helperIn.Flush(); } catch { } }
 
         public void InitializeUI()
         {
@@ -64,69 +75,54 @@ namespace UtilityHud
             var font = rig?.playerText1?.font ?? Resources.FindObjectsOfTypeAll<TMP_FontAsset>().FirstOrDefault();
             var mat = rig != null ? Object.Instantiate(rig.playerText1.material) : null;
 
-            var album = new GameObject("AlbumArt");
-            album.transform.SetParent(cam, false);
-            album.transform.localPosition = new Vector3(-0.27f, 0.21f, 0.5f);
-            album.transform.localScale = Vector3.one * 0.05f;
-            albumSprite = album.AddComponent<SpriteRenderer>();
+            albumSprite = new GameObject("AlbumArt").AddComponent<SpriteRenderer>();
+            albumSprite.transform.SetParent(cam, false);
+            albumSprite.transform.localPosition = new Vector3(-0.27f, 0.21f, 0.5f);
+            albumSprite.transform.localScale = Vector3.one * 0.05f;
 
-            var text = new GameObject("MusicText");
-            musicText = text.AddComponent<TextMeshPro>();
+            var textObj = new GameObject("MusicText");
+            musicText = textObj.AddComponent<TextMeshPro>();
             musicText.richText = true;
             if (mat != null) musicText.material = mat;
             if (font != null) musicText.font = font;
             musicText.fontSize = 1.5f;
             musicText.alignment = TextAlignmentOptions.TopLeft;
-            text.transform.SetParent(cam, false);
-            text.transform.localPosition = new Vector3(0.5f, -0.02f, 0.5f);
-            text.transform.localScale = Vector3.one * 0.08f;
             musicText.color = Color.white;
+            textObj.transform.SetParent(cam, false);
+            textObj.transform.localPosition = new Vector3(0.5f, -0.02f, 0.5f);
+            textObj.transform.localScale = Vector3.one * 0.08f;
             uiReady = true;
+            initUntil = Time.time + InitDuration;
         }
 
-        static async Task FetchAsync()
+        static async Task FetchAsync(bool withThumbnail)
         {
-            if (string.IsNullOrEmpty(qsPath) || !File.Exists(qsPath)) return;
+            if (!HelperAlive) { StartHelper(); if (!HelperAlive) return; }
             try
             {
-                using (var proc = new Process
-                {
-                    StartInfo = new ProcessStartInfo
-                    {
-                        FileName = qsPath, Arguments = "-all",
-                        UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true
-                    }
-                })
-                {
-                    proc.Start();
-                    var output = await proc.StandardOutput.ReadToEndAsync();
-                    if (!proc.HasExited) proc.WaitForExit(5000);
-                    if (!proc.HasExited) try { proc.Kill(); } catch { }
+                helperIn.WriteLine(withThumbnail ? "info" : "light");
+                helperIn.Flush();
+                var line = await helperOut.ReadLineAsync();
+                if (string.IsNullOrEmpty(line)) return;
+                var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(line);
+                if (data == null) return;
 
-                    Title = "No Media Playing";
-                    Artist = "";
+                var newTitle = data.TryGetValue("Title", out var t) && !string.IsNullOrEmpty((string)t) ? (string)t : "No Media Playing";
+                var newArtist = data.TryGetValue("Artist", out var a) ? (string)a : "";
+                if (newTitle == "No Media Playing" && Title != "No Media Playing" && ++noMediaStreak < 3) return;
+                noMediaStreak = 0;
 
-                    var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(output);
-                    if (data == null) return;
+                pendingTitle = newTitle;
+                pendingArtist = newArtist;
+                dataQueued = true;
 
-                    Title = data.TryGetValue("Title", out var t) ? (string)t : "No Media Playing";
-                    Artist = data.TryGetValue("Artist", out var a) ? (string)a : "";
-
-                    if (data.TryGetValue("ThumbnailBase64", out var thumb) && !string.IsNullOrEmpty((string)thumb))
-                    {
-                        icon.LoadImage(Convert.FromBase64String((string)thumb));
-                        spriteQueued = true;
-                    }
-                }
+                if (data.TryGetValue("ThumbnailBase64", out var thumb) && !string.IsNullOrEmpty((string)thumb))
+                { icon.LoadImage(Convert.FromBase64String((string)thumb)); spriteQueued = true; }
             }
             catch { }
         }
 
-        IEnumerator FetchAfter(float delay)
-        {
-            yield return new WaitForSeconds(delay);
-            if (FetchIdle) fetchTask = FetchAsync();
-        }
+        static void TriggerFetch() { if (FetchIdle) { fetchStart = Time.time; fetchTask = FetchAsync(false); } }
 
         void Update()
         {
@@ -134,46 +130,33 @@ namespace UtilityHud
             if (!uiReady) { InitializeUI(); return; }
             if (musicText == null || Camera.main == null) { uiReady = false; return; }
 
-            if (Time.time > nextPoll && FetchIdle) { nextPoll = Time.time + 2f; fetchTask = FetchAsync(); }
+            if (!FetchIdle && !HelperAlive) fetchTask = null;
+            if (!FetchIdle && Time.time - fetchStart > 10f) { fetchTask = null; try { if (HelperAlive) helper.Kill(); helper?.Dispose(); } catch { } helper = null; }
 
-            if (spriteQueued && albumSprite != null)
-            {
-                spriteQueued = false;
-                if (spriteAsset != null) Object.Destroy(spriteAsset);
-                spriteAsset = Sprite.Create(icon, new Rect(0, 0, icon.width, icon.height), new Vector2(0.5f, 0.5f));
-                albumSprite.sprite = spriteAsset;
-            }
+            if (FetchIdle && Time.time > nextPoll) { nextPoll = Time.time + LightInterval; var doFull = Time.time > nextFullPoll; if (doFull) nextFullPoll = Time.time + FullInterval; fetchStart = Time.time; fetchTask = FetchAsync(doFull); }
 
-            musicText.text = controlMode ? $"{Title}\nCreator: {Artist} [Control Mode]" : $"{Title}\nCreator: {Artist}";
+            if (dataQueued) { dataQueued = false; Title = pendingTitle; Artist = pendingArtist; }
+            if (spriteQueued && albumSprite != null) { spriteQueued = false; if (spriteAsset != null) Object.Destroy(spriteAsset); spriteAsset = Sprite.Create(icon, new Rect(0, 0, icon.width, icon.height), new Vector2(0.5f, 0.5f)); albumSprite.sprite = spriteAsset; }
+
+            musicText.text = Time.time < initUntil ? "Initializing..." : (controlMode ? $"{Title}\n{Artist} [Control Mode]" : $"{Title}\n{Artist}");
 
             var input = ControllerInputPoller.instance;
             if (input == null) return;
 
             var bDown = input.rightControllerSecondaryButton;
-            if (bDown && !lastB)
-            {
-                controlMode = !controlMode;
-                if (controlMode && !wasControl)
-                {
-                    lastL = input.leftControllerIndexFloat;
-                    lastR = input.rightControllerIndexFloat;
-                    lastA = input.rightControllerPrimaryButton;
-                }
-            }
+            if (bDown && !lastB) { controlMode = !controlMode; if (controlMode && !wasControl) { lastL = input.leftControllerIndexFloat; lastR = input.rightControllerIndexFloat; lastA = input.rightControllerPrimaryButton; } }
             lastB = bDown;
 
             if (controlMode && wasControl)
             {
                 var li = input.leftControllerIndexFloat;
-                if (lastL >= 0.5f && li < 0.5f && Time.time > cdPrev) { cdPrev = Time.time + 0.5f; Press(VK.Prev); StartCoroutine(FetchAfter(0.1f)); }
+                if (lastL >= 0.5f && li < 0.5f && Time.time > cdPrev) { cdPrev = Time.time + InputCooldown; Send("prev"); TriggerFetch(); }
                 lastL = li;
-
                 var ri = input.rightControllerIndexFloat;
-                if (lastR >= 0.5f && ri < 0.5f && Time.time > cdNext) { cdNext = Time.time + 0.5f; Press(VK.Next); StartCoroutine(FetchAfter(0.1f)); }
+                if (lastR >= 0.5f && ri < 0.5f && Time.time > cdNext) { cdNext = Time.time + InputCooldown; Send("next"); TriggerFetch(); }
                 lastR = ri;
-
                 var aDown = input.rightControllerPrimaryButton;
-                if (aDown && !lastA && Time.time > cdPlay) { cdPlay = Time.time + 0.5f; Press(VK.PlayPause); }
+                if (aDown && !lastA && Time.time > cdPlay) { cdPlay = Time.time + InputCooldown; Send("playpause"); TriggerFetch(); }
                 lastA = aDown;
             }
             wasControl = controlMode;
@@ -181,8 +164,8 @@ namespace UtilityHud
 
         void OnDestroy()
         {
-            foreach (var p in Process.GetProcessesByName("QuickSong"))
-                try { p.Kill(); p.Dispose(); } catch { }
+            try { helperIn?.WriteLine("exit"); helperIn?.Flush(); } catch { }
+            try { if (HelperAlive) helper.Kill(); helper?.Dispose(); } catch { }
         }
     }
 }
